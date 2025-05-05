@@ -116,7 +116,7 @@ if __name__ == "__main__":
     encoder.eval()
     encoder.to(device)
 
-    percept = lpips.PerceptualLoss(model="net-lin", net="vgg", use_gpu=device.startswith("cuda"))
+    percept = lpips.PerceptualLoss(model="net-lin", net="vgg", use_gpu=(device.type == "cuda"))
     id_loss = id_loss.IDLoss(os.path.join(args.model_path, 'model_ir_se50.pth')).to(device).eval()
 
     print('Load models successfully!')
