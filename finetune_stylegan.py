@@ -109,11 +109,10 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         if i > args.iter:
             print("Done!")
-
             break
 
-        real_img = next(loader)
-        real_img = real_img.to(device)
+        # 1) async copy from pinned DataLoader
+        real_img = next(loader).to(device, non_blocking=True)
 
         requires_grad(generator, False)
         requires_grad(discriminator, True)
@@ -123,8 +122,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
-            fake_img, _ = augment(fake_img, ada_aug_p)
-
+            fake_img,     _ = augment(fake_img, ada_aug_p)
         else:
             real_img_aug = real_img
 
@@ -136,7 +134,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         loss_dict["real_score"] = real_pred.mean()
         loss_dict["fake_score"] = fake_pred.mean()
 
-        discriminator.zero_grad()
+        # 2) optimizer.zero_grad with set_to_none
+        d_optim.zero_grad(set_to_none=True)
         d_loss.backward()
         d_optim.step()
 
@@ -144,23 +143,21 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             ada_aug_p = ada_augment.tune(real_pred)
             r_t_stat = ada_augment.r_t_stat
 
-        d_regularize = i % args.d_reg_every == 0
-
+        d_regularize = (i % args.d_reg_every == 0)
         if d_regularize:
             real_img.requires_grad = True
 
             if args.augment:
                 real_img_aug, _ = augment(real_img, ada_aug_p)
-
             else:
                 real_img_aug = real_img
 
             real_pred = discriminator(real_img_aug)
-            r1_loss = d_r1_loss(real_pred, real_img)
+            r1_loss  = d_r1_loss(real_pred, real_img)
 
-            discriminator.zero_grad()
+            # 3) use optimizer.zero_grad here as well
+            d_optim.zero_grad(set_to_none=True)
             (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
-
             d_optim.step()
 
         loss_dict["r1"] = r1_loss
@@ -168,20 +165,22 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         requires_grad(generator, True)
         requires_grad(discriminator, False)
 
-        noise = mixing_noise(args.batch, args.latent, args.mixing, device)
+        noise    = mixing_noise(args.batch, args.latent, args.mixing, device)
         fake_img, _ = generator(noise)
 
         if args.augment:
             fake_img, _ = augment(fake_img, ada_aug_p)
 
         fake_pred = discriminator(fake_img)
-        g_loss = g_nonsaturating_loss(fake_pred)
+        g_loss    = g_nonsaturating_loss(fake_pred)
 
         loss_dict["g"] = g_loss
 
-        generator.zero_grad()
+        # generator zero_grad → optimizer.zero_grad
+        g_optim.zero_grad(set_to_none=True)
         g_loss.backward()
         g_optim.step()
+
 
         g_regularize = i % args.g_reg_every == 0
 
@@ -333,26 +332,29 @@ if __name__ == "__main__":
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
 
+        # ─── checkpoint loading (auto‐detect) ────────────────────────────────────
     if args.ckpt is not None:
-        print("load model:", args.ckpt)
+        print("Loading checkpoint:", args.ckpt)
+        # ensure we unpickle everything (models, optimizers, start_iter)
+        ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
 
-        ckpt = torch.load(args.ckpt, map_location=lambda storage, loc: storage)
+        # if it only contains g_ema → weights‐only start
+        if "g" not in ckpt and "g_ema" in ckpt:
+            generator.load_state_dict(ckpt["g_ema"])
+            g_ema.load_state_dict(ckpt["g_ema"])
+            args.start_iter = 0
+        else:
+            # full resume: models, optimizers, and iteration counter
+            generator.load_state_dict(ckpt["g"])
+            discriminator.load_state_dict(ckpt["d"])
+            g_ema.load_state_dict(ckpt["g_ema"])
+            if "g_optim" in ckpt:
+                g_optim.load_state_dict(ckpt["g_optim"])
+            if "d_optim" in ckpt:
+                d_optim.load_state_dict(ckpt["d_optim"])
+            args.start_iter = ckpt.get("start_iter", args.start_iter)
+    # ─────────────────────────────────────────────────────────────────────────
 
-        try:
-            ckpt_name = os.path.basename(args.ckpt)
-            args.start_iter = int(os.path.splitext(ckpt_name)[0])
-
-        except ValueError:
-            pass
-
-        generator.load_state_dict(ckpt["g"])
-        discriminator.load_state_dict(ckpt["d"])
-        g_ema.load_state_dict(ckpt["g_ema"])
-        
-        if "g_optim" in ckpt:
-            g_optim.load_state_dict(ckpt["g_optim"])
-        if "d_optim" in ckpt:
-            d_optim.load_state_dict(ckpt["d_optim"])
 
     if args.distributed:
         generator = nn.parallel.DistributedDataParallel(

@@ -159,76 +159,73 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, insty
     
     for idx in pbar:
         i = idx + args.start_iter
-        
-        which = i % args.subspace_freq # defines whether we use paired data
+        which = i % args.subspace_freq
 
         if i > args.iter:
             print("Done!")
             break
 
-        # sample S
-        real_img = next(loader)
-        real_img = real_img.to(device)
+        # load real images asynchronously from pinned memory
+        real_img = next(loader).to(device, non_blocking=True)
 
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
+        # sample paired data and move to GPU asynchronously
         if which == 0:
-            # sample z^+_e, z for Lsty, Lcon and Ladv
-            exstyle, _, _ = get_paired_data(instyles, Simgs, exstyles, batch_size=args.batch, random_ind=8)
-            exstyle = exstyle.to(device)
+            exstyle, _, _ = get_paired_data(instyles, Simgs, exstyles,
+                                            batch_size=args.batch, random_ind=8)
+            exstyle = exstyle.to(device, non_blocking=True)
             instyle = mixing_noise(args.batch, args.latent, args.mixing, device)
             z_plus_latent = False
         else:
-            # sample z^+_e, z^+_i and S for Eq. (4)
-            exstyle, instyle, real_img = get_paired_data(instyles, Simgs, exstyles, batch_size=args.batch, random_ind=8)
-            exstyle = exstyle.to(device)
-            instyle = [instyle.to(device)]
-            real_img = real_img.to(device)
+            exstyle, instyle, real_img = get_paired_data(instyles, Simgs, exstyles,
+                                                        batch_size=args.batch, random_ind=8)
+            exstyle = exstyle.to(device, non_blocking=True)
+            instyle = [instyle.to(device, non_blocking=True)]
+            real_img = real_img.to(device, non_blocking=True)
             z_plus_latent = True
-            
+
         fake_img, _ = generator(instyle, exstyle, use_res=True, z_plus_latent=z_plus_latent)
 
+        # optional ADA augmentation
         if args.augment:
             real_img_aug, _ = augment(real_img, ada_aug_p)
-            fake_img, _ = augment(fake_img, ada_aug_p)
-
+            fake_img,     _ = augment(fake_img, ada_aug_p)
         else:
             real_img_aug = real_img
 
+        # discriminator forward
         fake_pred = discriminator(fake_img)
         real_pred = discriminator(real_img_aug)
-        d_loss = d_logistic_loss(real_pred, fake_pred)
+        d_loss    = d_logistic_loss(real_pred, fake_pred)
 
-        loss_dict["d"] = d_loss # Ladv
+        loss_dict["d"]          = d_loss
         loss_dict["real_score"] = real_pred.mean()
         loss_dict["fake_score"] = fake_pred.mean()
 
-        discriminator.zero_grad()
+        # clear grads and step optimizer with set_to_none
+        d_optim.zero_grad(set_to_none=True)
         d_loss.backward()
         d_optim.step()
 
         if args.augment and args.augment_p == 0:
             ada_aug_p = ada_augment.tune(real_pred)
-            r_t_stat = ada_augment.r_t_stat
 
-        d_regularize = i % args.d_reg_every == 0
-
-        if d_regularize:
+        # R1 regularization
+        if i % args.d_reg_every == 0:
             real_img.requires_grad = True
-
             if args.augment:
                 real_img_aug, _ = augment(real_img, ada_aug_p)
-
             else:
                 real_img_aug = real_img
 
             real_pred = discriminator(real_img_aug)
-            r1_loss = d_r1_loss(real_pred, real_img)
-            
-            discriminator.zero_grad()
-            (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
+            r1_loss  = d_r1_loss(real_pred, real_img)
 
+            # clear grads again and step
+            d_optim.zero_grad(set_to_none=True)
+            (args.r1 / 2 * r1_loss * args.d_reg_every + 0 * real_pred[0]).backward()
             d_optim.step()
 
         loss_dict["r1"] = r1_loss
@@ -292,7 +289,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, insty
         loss_dict["id"] = ID_loss # LID in Lcon
         loss_dict["sty"] = sty_loss # Lsty
         g_loss = g_loss + gr_loss + sty_loss + l2_reg_loss + ID_loss
-
+                
         generator.zero_grad()
         g_loss.backward()
         g_optim.step()
@@ -434,28 +431,29 @@ if __name__ == "__main__":
         betas=(0 ** d_reg_ratio, 0.99 ** d_reg_ratio),
     )
 
+    # ─── checkpoint loading (auto‐detect, full‐state) ──────────────────────────
     if args.ckpt is not None:
-        print("load model:", args.ckpt)
+        print("Loading checkpoint:", args.ckpt)
+        # Under PyTorch ≥2.6, weights_only defaults to True, which would skip non‐tensor fields.
+        # Here we set weights_only=False to unpickle start_iter and optimizer state too.
+        ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
 
-        ckpt = torch.load(args.ckpt, map_location=lambda storage, loc: storage)
-
-        #try:
-        #    ckpt_name = os.path.basename(args.ckpt)
-        #    args.start_iter = int(os.path.splitext(ckpt_name)[0])
-
-        #except ValueError:
-        #    pass
-
-        generator.load_state_dict(ckpt["g"])
-        #generator.generator.load_state_dict(ckpt["g_ema"])
-        discriminator.load_state_dict(ckpt["d"])
-        g_ema.load_state_dict(ckpt["g_ema"])
-        #g_ema.generator.load_state_dict(ckpt["g_ema"])
-        
-        if "g_optim" in ckpt:
-            g_optim.load_state_dict(ckpt["g_optim"])
-        if "d_optim" in ckpt:
-            d_optim.load_state_dict(ckpt["d_optim"])
+        # if it's just a pretrained generator (only 'g_ema'), do a fresh fine‐tune start
+        if "g" not in ckpt and "g_ema" in ckpt:
+            generator.load_state_dict(ckpt["g_ema"])
+            g_ema.load_state_dict(ckpt["g_ema"])
+            args.start_iter = 0
+        else:
+            # full checkpoint: resume models, optimizers, and iteration count
+            generator.load_state_dict(ckpt["g"])
+            discriminator.load_state_dict(ckpt["d"])
+            g_ema.load_state_dict(ckpt["g_ema"])
+            if "g_optim" in ckpt:
+                g_optim.load_state_dict(ckpt["g_optim"])
+            if "d_optim" in ckpt:
+                d_optim.load_state_dict(ckpt["d_optim"])
+            args.start_iter = ckpt.get("start_iter", args.start_iter)
+    # ────────────────────────────────────────────────────────────────────────────
 
     if args.distributed:
         generator = nn.parallel.DistributedDataParallel(
@@ -492,7 +490,10 @@ if __name__ == "__main__":
         batch_size=args.batch,
         sampler=data_sampler(dataset, shuffle=True, distributed=args.distributed),
         drop_last=True,
+        num_workers=4,         # <— spawn 4 worker processes
+        pin_memory=True,       # <— page‐lock host memory for faster .to(device)
     )
+
 
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project="dualstylegan")
